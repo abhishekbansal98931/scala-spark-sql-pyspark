@@ -1,0 +1,92 @@
+#Import libraries
+import org.apache.spark.sql.{Column, DataFrame, SparkSession}
+import org.apache.spark.sql.expressions.UserDefinedFunction
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import org.apache.spark.sql.functions.{row_number}
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions
+import org.apache.spark.sql.types.IntegerType
+import java.util.Properties
+import org.apache.spark.sql.functions.{collect_list, udf, lit}
+
+
+def dateAddDay(date: String, days: Int, inputFormat: String = "yyyy-MM-dd", outputFormat: String = "yyyy-MM-dd") : String = {
+    val dateAux = Calendar.getInstance()
+    dateAux.setTime(new SimpleDateFormat(inputFormat).parse(date))
+    dateAux.add(Calendar.DATE, days)
+    return new SimpleDateFormat(outputFormat).format(dateAux.getTime())
+}
+
+#Read required tables
+val fact_claims : DataFrame = spark.read.parquet("/projects/discovery/warehouse/discovery_prd.db/fact_claims.parquet")
+val nn_chron : DataFrame = spark.read.parquet("/projects/discovery/warehouse/novo_nordisk/nn_chron.parquet")
+val dim_member : DataFrame = spark.read.parquet("/projects/discovery/warehouse/discovery_prd.db/dim_member.parquet")
+val dim_nappi : DataFrame = spark.read.parquet("/projects/discovery/warehouse/discovery_prd.db/dim_nappi.parquet")
+//val dim_date: DataFrame = spark.read.parquet("/projects/discovery/warehouse/QHSA/dimension_tables/dim_date.parquet")
+val dim_plan_group: DataFrame = spark.read.parquet("/projects/discovery/warehouse/QHSA/dimension_tables/dim_plan_groupings.parquet/")
+val dim_provider = spark.read.parquet("/projects/discovery/warehouse/discovery_prd.db/dim_provider.parquet")
+val dim_mortality : DataFrame = spark.read.parquet("/projects/discovery/warehouse/discovery_prd.db/dim_mortality.parquet")
+
+#Read csv
+val doctor : DataFrame = spark.read.option("header","true").csv("/home/abansal/diagnosing_doctors.csv")
+
+#Cross join
+val all_patient_dates = all_patients.crossJoin(all_dates)
+
+#Groupby, joins, partition by
+ val final_ipd = all_patient_dates.as("d1")
+                            .join(dim_mem_filtered.as("d2"), $"d1.entity_no" === $"d2.entity_no" && $"d1.month_key" === $"d2.month_key", "left")
+                            .withColumn("flag", when($"d2.entity_no".isNull,0).otherwise(1))
+                            .select($"d1.entity_no", $"d1.month_key", $"flag", $"d2.date_of_birth", $"d2.gender", $"d2.province", $"d2.region_of_residence", $"d2.health_region", $"d2.age", $"plan_grp", $"tr_practice_type_desc",
+                                    $"epilepsy", $"haemophilia", $"glaucoma", $"adrenal_insufficiency", $"asthma", $"bipolar_mood_disorder", $"bronchiectasis", $"congestive_cardiac_failure", $"cardiomyopathy", $"others", $"death_flag")
+                            .withColumn("flag_lag",coalesce(lag($"flag",1).over(Window.partitionBy($"entity_no").orderBy($"month_key".asc)),lit(0)))
+                            .withColumn("flag_lead",coalesce(lead($"flag",1).over(Window.partitionBy($"entity_no").orderBy($"month_key".asc)),lit(1)))
+                            .withColumn("flag_1_0_do", when($"flag_lead" === 0 && $"flag" === 1,1).otherwise(0))
+                            .withColumn("flag_0_1_inc", when($"flag_lag" === 0 && $"flag" === 1,1).otherwise(0))
+                            .withColumn("flag_1_1_prev", when($"flag_lag" === 1 && $"flag" === 1,1).otherwise(0))
+                            .withColumn("flag_do_death", when($"flag_1_0_do" === 1 && $"death_flag" === 1, 1).otherwise(0))
+                            .filter($"flag" === 1)
+                            .join(entity_deg_filtered, Seq("entity_no"))
+                            .withColumn("double_inc", row_number().over(Window.partitionBy($"entity_no").orderBy($"flag_0_1_inc".desc, $"month_key".asc)))
+                            .withColumn("flag_double_inc", when($"double_inc" > 1 && $"flag_0_1_inc" === 1, 1).otherwise(0))
+                            .withColumn("flag_1_1_prev_new", when($"flag_double_inc" === 1, $"flag_1_1_prev" + 1).otherwise($"flag_1_1_prev"))
+                            .withColumn("flag_0_1_inc_new", when($"flag_double_inc" === 1, $"flag_0_1_inc" - 1).otherwise($"flag_0_1_inc"))
+                            .drop($"flag_1_1_prev")
+                            .drop($"flag_0_1_inc")
+                            
+
+// val final2 = final_ipd
+//                     .filter($"month_key" > 200801)
+//                     .groupBy($"month_key")
+//                     .agg(sum($"flag_1_0_do"), sum($"flag_0_1_inc"), sum($"flag_1_1_prev"))
+
+// val final2 = final_ipd
+//                     .groupBy($"month_key")
+//                     .agg(sum($"flag_1_0_do"), sum($"flag_0_1_inc"), sum($"flag_1_1_prev"))
+                    
+val final2 = final_ipd
+                    .withColumn("age_band" 
+                            ,   when($"age" <  12, "0 to 12")
+                            .when($"age".between(12,18) , "12 to 18")
+                            .when($"age".between(18,30) , "18 to 30")
+                            .when($"age".between(30,40) , "30 to 40")
+                            .when($"age".between(40,50) , "40 to 50")
+                            .when($"age".between(50,60) , "50 to 60")
+                            .when($"age".between(60,70) , "60 to 70")
+                            .when($"age".between(70,80) , "70 to 80")
+                            .when($"age".between(80,90) , "80 to 90")
+                            .when($"age".between(90,100) , "90 to 100")
+                            .otherwise("100 + ")
+                        )
+                    .select($"month_key", $"flag", $"age_band", $"gender", $"province", $"region_of_residence", $"health_region", $"age", $"flag_lag", $"flag_lead", $"flag_1_0_do", $"flag_0_1_inc_new".as("flag_0_1_inc"), $"flag_1_1_prev_new".as("flag_1_1_prev"), $"deg_code", $"plan_grp", $"tr_practice_type_desc", $"epilepsy", $"haemophilia", $"glaucoma", $"adrenal_insufficiency", $"asthma", $"bipolar_mood_disorder", $"bronchiectasis", $"congestive_cardiac_failure", $"cardiomyopathy", $"others", $"flag_do_death")
+                    .filter($"flag" === 1)
+                    .withColumn("year", substring($"month_key",1,4))
+                    .groupBy($"year", $"month_key", $"age_band", $"gender", $"province", $"region_of_residence", $"health_region", $"deg_code", $"plan_grp", $"tr_practice_type_desc", $"epilepsy", $"haemophilia", $"glaucoma", $"adrenal_insufficiency", $"asthma", $"bipolar_mood_disorder", $"bronchiectasis", $"congestive_cardiac_failure", $"cardiomyopathy", $"others")
+                    .agg(sum($"flag_1_0_do").as("do"), sum($"flag_0_1_inc").as("inc"), sum($"flag_1_1_prev").as("prev"), sum($"flag_do_death").as("deaths"))
+ 
+ #Saving output as csv
+ final3.repartition(1).write.option("header","true").mode("overwrite").csv("/home/abansal/QDose_NEP040_20201209")
+ 
+ 
+ 
